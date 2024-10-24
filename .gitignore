@@ -10,6 +10,7 @@ mydb
 .Python
 build/
 develop-eggs/
+test_db/
 dist/
 downloads/
 eggs/
