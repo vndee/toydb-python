@@ -3,7 +3,7 @@ import json
 import shutil
 import mmh3  # For Bloom filter hashing
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Iterator, Set
+from typing import Any, Dict, List, Optional, Iterator, Tuple
 from pathlib import Path
 from threading import RLock
 from collections import defaultdict
@@ -79,11 +79,11 @@ class Level:
 class Transaction:
     """Handles atomic operations"""
 
-    def __init__(self, db: "ConcurrentLSMTree"):
+    def __init__(self, db: "ImprovedLSMTree"):
         self.db = db
         self.id = datetime.utcnow().isoformat()
         self.writes: Dict[str, Any] = {}  # Pending writes
-        self.reads: Set[str] = set()  # Read set for conflict detection
+        self.reads: Dict[str, Any] = {}  # Read set for conflict detection with values
         self.committed = False
         self.active = False  # Track if transaction is active
 
@@ -111,6 +111,9 @@ class Transaction:
         """Stage a write operation"""
         if not self.active:
             raise DatabaseError("Transaction not active")
+        # Automatically add to read set if not already there
+        if key not in self.reads:
+            self.reads[key] = self.db.get(key)
         self.writes[key] = value
 
     def get(self, key: str) -> Optional[Any]:
@@ -121,8 +124,9 @@ class Transaction:
         if key in self.writes:
             return self.writes[key]
 
-        self.reads.add(key)
-        return self.db.get(key)
+        value = self.db.get(key)
+        self.reads[key] = value  # Store the value at read time
+        return value
 
     def commit(self) -> bool:
         """Try to commit transaction"""
@@ -132,10 +136,9 @@ class Transaction:
         try:
             with self.db.memtable_lock:  # Lock for atomic commit
                 # Check for conflicts
-                for key in self.reads:
+                for key, read_value in self.reads.items():
                     current_value = self.db.get(key)
-                    staged_value = self.get(key)
-                    if current_value != staged_value:
+                    if current_value != read_value:
                         return False  # Conflict detected
 
                 # Write WAL entries
@@ -197,8 +200,8 @@ class SSTableWithBloom(SSTable):
         return super().get(key)
 
 
-class ConcurrentLSMTree:
-    """LSM Tree with improved concurrency and transactions"""
+class ImprovedLSMTree:
+    """LSM Tree with improved concurrency, transactions, bloom-filter and leveled storage"""
 
     def __init__(self, base_path: str):
         self.base_path = Path(base_path)
@@ -403,6 +406,40 @@ class ConcurrentLSMTree:
 
         return None
 
+    def delete(self, key: str) -> None:
+        """Delete a key"""
+        with self.memtable_lock:
+            if not isinstance(key, str):
+                raise ValueError("Key must be a string")
+
+            self.wal.delete(key)
+            self.set(key, None)  # Use None as tombstone
+
+    def range_query(self, start_key: str, end_key: str) -> Iterator[Tuple[str, Any]]:
+        """Perform a range query"""
+        with self.memtable_lock:
+            # Get from memtable
+            seen_keys = set()
+            for key, value in self.memtable.range_scan(start_key, end_key):
+                if value is not None:  # Skip tombstones
+                    seen_keys.add(key)
+                    yield (key, value)
+
+            # Get from each level, starting from newest
+            for level in self.levels:
+                for sstable in reversed(level.sstables):
+                    for key, value in sstable.range_scan(start_key, end_key):
+                        if key not in seen_keys and value is not None:
+                            seen_keys.add(key)
+                            yield (key, value)
+
+    def close(self) -> None:
+        """Ensure all data is persisted to disk"""
+        with self.memtable_lock:
+            if self.memtable.entries:
+                self._flush_memtable()
+            self.wal.checkpoint()
+
 
 def test_database():
     """Test basic database operations"""
@@ -412,7 +449,7 @@ def test_database():
         shutil.rmtree(test_dir)
 
     # Create database
-    db = ConcurrentLSMTree(test_dir)
+    db = ImprovedLSMTree(test_dir)
 
     # Test basic operations
     print("\nTesting basic operations...")
@@ -448,6 +485,8 @@ def test_database():
     with db.transaction() as txn1:
         # Simulate concurrent modification
         db.set("conflict_key", "modified")
+
+        # Now try to modify the value
         txn1.set("conflict_key", "txn1_value")
         assert not txn1.commit()  # Should fail due to conflict
 

@@ -3,7 +3,8 @@ import shutil
 import pytest
 from threading import Thread
 from time import sleep
-from toydb.database import LSMTree, DatabaseError
+from toydb.database_part_2 import ConcurrentLSMTree as LSMTree
+from toydb.database import DatabaseError
 
 
 @pytest.fixture
