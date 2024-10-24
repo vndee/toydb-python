@@ -235,8 +235,12 @@ class LSMTree:
                 f"Failed to initialize database at '{base_path}': {str(e)}"
             )
 
-        self.memtable = MemTable()
+        # Our "Inbox" for new data
+        self.memtable = MemTable(max_size=1000)
+
+        # Our "Folders" of sorted data
         self.sstables: List[SSTable] = []
+
         self.max_sstables = 5  # Limit on number of SSTables
         self.lock = RLock()
 
@@ -341,12 +345,6 @@ class LSMTree:
             # 3. Not found anywhere
             return None
 
-    def delete(self, key: str):
-        """Delete a key"""
-        with self.lock:
-            self.wal.delete(key)
-            self.set(key, None)  # Use None as tombstone
-
     def range_query(self, start_key: str, end_key: str) -> Iterator[Tuple[str, Any]]:
         """Perform a range query"""
         with self.lock:
@@ -362,6 +360,12 @@ class LSMTree:
                         seen_keys.add(key)
                         if value is not None:  # Skip tombstones
                             yield (key, value)
+
+    def delete(self, key: str):
+        """Delete a key"""
+        with self.lock:
+            self.wal.delete(key)
+            self.set(key, None)  # Use None as tombstone
 
     def close(self):
         """Ensure all data is persisted to disk"""
